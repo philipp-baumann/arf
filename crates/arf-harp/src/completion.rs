@@ -475,11 +475,18 @@ pub fn get_completions(line: &str, cursor_pos: usize, timeout_ms: u64) -> HarpRe
         }
     }
 
-    // Determine effective timeout:
-    // - Disable timeout for package::func completions (they need full results and are worth waiting for)
-    // - This matches radian's behavior
-    let effective_timeout = if contains_namespace_operator(&line[..cursor_pos.min(line.len())]) {
-        0 // No timeout for :: completions
+    // Raise timeout for contexts where R's completer does extra work:
+    // - `::` completions: enumerate package exports (slow)
+    // - inside an unclosed `(` (function call or grouped expression): R also looks up argument
+    //   names (~150ms vs ~20ms at top level)
+    // Use a generous fixed floor (1000ms) so unusually slow environments still get
+    // a safety boundary. timeout_ms=0 (no limit) is preserved as-is.
+    let before_cursor = &line[..cursor_pos.min(line.len())];
+    let effective_timeout = if timeout_ms == 0 {
+        0
+    } else if contains_namespace_operator(before_cursor) || has_unmatched_open_paren(before_cursor)
+    {
+        timeout_ms.max(1000)
     } else {
         timeout_ms
     };
@@ -490,6 +497,48 @@ pub fn get_completions(line: &str, cursor_pos: usize, timeout_ms: u64) -> HarpRe
 /// Check if the text contains a namespace operator (:: or :::).
 fn contains_namespace_operator(text: &str) -> bool {
     text.contains("::")
+}
+
+/// Returns true if the cursor (end of `text`) is inside an unclosed `(` — i.e.,
+/// there is at least one `(` with no matching `)` that is not inside a string
+/// literal or comment. This covers both function calls (`str(aaa_`) and grouped
+/// expressions (`x <- (aaa_`).
+///
+/// Uses a forward scan with lightweight string tracking (double/single quotes
+/// and backslash escapes). Unmatched `)` are treated as no-ops (depth clamped
+/// at 0) so that expressions like `1) + str(aaa_` are correctly detected as
+/// being inside `str(`.
+fn has_unmatched_open_paren(text: &str) -> bool {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut in_comment = false;
+    let mut escaped = false;
+    let mut depth = 0i32;
+
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        // Comment runs to end of line only; resume scanning on the next line.
+        if in_comment {
+            if c == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        match c {
+            '#' if !in_double && !in_single => in_comment = true,
+            '\\' if in_double || in_single => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '(' if !in_double && !in_single => depth += 1,
+            ')' if !in_double && !in_single => depth = (depth - 1).max(0),
+            _ => {}
+        }
+    }
+
+    depth > 0
 }
 
 /// Get R's built-in completions using utils package functions.
@@ -1090,5 +1139,46 @@ mod tests {
         assert_eq!(extract_identifier_before_cursor(""), None);
         assert_eq!(extract_identifier_before_cursor("123"), None);
         assert_eq!(extract_identifier_before_cursor("x <- "), None);
+    }
+
+    #[test]
+    fn test_has_unmatched_open_paren() {
+        // Inside a function call (cursor before closing paren)
+        assert!(has_unmatched_open_paren("str(aaa_"));
+        assert!(has_unmatched_open_paren("foo(x ="));
+        assert!(has_unmatched_open_paren("foo(x, y ="));
+        // Cursor after comma: e.g. full line "foo(x,)" with cursor at pos 6
+        assert!(has_unmatched_open_paren("foo(x,"));
+
+        // Nested: cursor inside outer call, inner call already closed
+        // e.g. "foo(x = bar()" → outer ( unmatched
+        assert!(has_unmatched_open_paren("foo(x = bar()"));
+
+        // Extra `)` earlier in line: depth is clamped at 0 so the `str(` is still found.
+        assert!(has_unmatched_open_paren("1) + str(aaa_"));
+
+        // Top-level: no open paren
+        assert!(!has_unmatched_open_paren("aaa_bbb"));
+        assert!(!has_unmatched_open_paren(""));
+
+        // Balanced parens (cursor after closing paren)
+        assert!(!has_unmatched_open_paren("str(aaa_)"));
+        assert!(!has_unmatched_open_paren("foo(x = bar())"));
+
+        // Parens inside string literals are ignored
+        assert!(!has_unmatched_open_paren(r#"x <- "("; aaa_"#));
+        assert!(!has_unmatched_open_paren(r#""("#));
+        assert!(has_unmatched_open_paren(r#"paste("(", x"#)); // cursor inside paste()
+        assert!(has_unmatched_open_paren("paste('(', x")); // single-quoted string
+
+        // Paren in single-line comment is ignored
+        assert!(!has_unmatched_open_paren("# str(aaa_"));
+
+        // Multiline: comment on first line must not swallow subsequent lines
+        assert!(has_unmatched_open_paren("# note (\nstr(aaa_"));
+        // Function call before comment, cursor on next line
+        assert!(has_unmatched_open_paren("foo( # comment\naaa_"));
+        // Comment-only first line, no function call after
+        assert!(!has_unmatched_open_paren("# note (\naaa_"));
     }
 }
